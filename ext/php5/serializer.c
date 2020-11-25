@@ -433,6 +433,65 @@ void ddtrace_serialize_span_to_array(ddtrace_span_fci *span_fci, zval *array TSR
     add_next_index_zval(array, el);
 }
 
+static void dd_fatal_error_type(int code, zval **type) {
+    const char *error_type = "{unknown error}";
+    switch (code) {
+        case E_ERROR:
+            error_type = "E_ERROR";
+            break;
+        case E_CORE_ERROR:
+            error_type = "E_CORE_ERROR";
+            break;
+        case E_COMPILE_ERROR:
+            error_type = "E_COMPILE_ERROR";
+            break;
+        case E_USER_ERROR:
+            error_type = "E_USER_ERROR";
+            break;
+    }
+    ALLOC_ZVAL(*type);
+    ZVAL_STRING(*type, error_type, 1);
+}
+
+static void dd_fatal_error_msg(const char *format, va_list args, zval **msg) {
+    // TODO Figure this out
+    ALLOC_ZVAL(*msg);
+    ZVAL_STRING(*msg, format, 1);
+}
+
+static void dd_fatal_error_stack(zval **stack) {
+    // TODO Figure this out
+    ALLOC_ZVAL(*stack);
+    ZVAL_STRING(*stack, "0. fake() My foo stack", 1);
+}
+
+typedef struct dd_error_info {
+    zval *type;
+    zval *msg;
+    zval *stack;
+} dd_error_info;
+
+static int dd_fatal_error_to_meta(zval *meta, dd_error_info error) {
+    if (error.type) {
+        add_assoc_zval(meta, "error.type", error.type);
+    }
+    if (error.msg) {
+        add_assoc_zval(meta, "error.msg", error.msg);
+    }
+    if (error.stack) {
+        add_assoc_zval(meta, "error.stack", error.stack);
+    }
+    return error.type && error.msg ? SUCCESS : FAILURE;
+}
+
+static dd_error_info dd_fatal_error(int type, const char *format, va_list args) {
+    dd_error_info error = {0};
+    dd_fatal_error_type(type, &error.type);
+    dd_fatal_error_msg(format, args, &error.msg);
+    dd_fatal_error_stack(&error.stack);
+    return error;
+}
+
 void ddtrace_error_cb(DDTRACE_ERROR_CB_PARAMETERS) {
     TSRMLS_FETCH();
 
@@ -445,14 +504,42 @@ void ddtrace_error_cb(DDTRACE_ERROR_CB_PARAMETERS) {
 
     bool is_fatal_error = type & (E_ERROR | E_CORE_ERROR | E_COMPILE_ERROR | E_USER_ERROR);
     if (EXPECTED(EG(active)) && EG(error_handling) == EH_NORMAL && UNEXPECTED(is_fatal_error)) {
-        ddtrace_exception_t *error = ddtrace_make_exception_from_error(DDTRACE_ERROR_CB_PARAM_PASSTHRU TSRMLS_CC);
-        ddtrace_span_fci *span = DDTRACE_G(open_spans_top);
-        while (span) {
-            ddtrace_span_attach_exception(span, error);
-            span = span->next;
+        /* If there is a fatal error in shutdown then this might not be an array
+         * because we set it to IS_NULL in RSHUTDOWN. We probably want a more
+         * robust way of detecting this, but I'm not sure how yet.
+         */
+        if (Z_TYPE(DDTRACE_G(additional_trace_meta)) == IS_ARRAY) {
+            dd_error_info error = dd_fatal_error(type, format, args);
+            dd_fatal_error_to_meta(&DDTRACE_G(additional_trace_meta), error);
+
+            ddtrace_span_fci *span;
+            for (span = DDTRACE_G(open_spans_top); span; span = span->next) {
+                if (span->exception || !span->span.span_data) {
+                    continue;
+                }
+                zval *meta = _read_span_property(span->span.span_data, ZEND_STRL("meta") TSRMLS_CC);
+                if (!meta) {
+                    continue;
+                }
+
+                if (Z_TYPE_P(meta) != IS_ARRAY) {
+                    zval_ptr_dtor(&meta);
+                    array_init_size(meta, ddtrace_num_error_tags);
+                }
+                dd_fatal_error_to_meta(meta, error);
+            }
+
+            if (error.type) {
+                zval_ptr_dtor(&error.type);
+            }
+            if (error.msg) {
+                zval_ptr_dtor(&error.msg);
+            }
+            if (error.stack) {
+                zval_ptr_dtor(&error.stack);
+            }
+            ddtrace_close_all_open_spans(TSRMLS_C);
         }
-        zval_ptr_dtor(&error);
-        ddtrace_close_all_open_spans(TSRMLS_C);
     }
 
     ddtrace_prev_error_cb(DDTRACE_ERROR_CB_PARAM_PASSTHRU);
